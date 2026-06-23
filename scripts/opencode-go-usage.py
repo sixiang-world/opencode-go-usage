@@ -6,7 +6,7 @@ import json
 import os
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 
 BASE_URL = "https://opencode.ai"
@@ -63,14 +64,24 @@ def save_config(workspace_id: str, auth_cookie: str):
     CONFIG_PATH.chmod(0o600)
 
 
-def save_history(result: dict):
-    record = {
+def save_history(result: dict, query_type: str = "quota"):
+    """保存查询记录到历史文件. query_type: 'quota' (默认用量) 或 'recent' (最近请求)."""
+    if query_type not in ("quota", "recent"):
+        raise ValueError(f"Unknown query_type: {query_type!r}")
+    record: dict[str, Any] = {
         "timestamp": datetime.now(TZ_BEIJING).isoformat(),
-        "account": result.get("account", ""),
-        "rolling": result.get("rolling"),
-        "weekly": result.get("weekly"),
-        "monthly": result.get("monthly"),
+        "type": query_type,
     }
+    if query_type == "quota":
+        record["account"] = result.get("account", "")
+        record["rolling"] = result.get("rolling")
+        record["weekly"] = result.get("weekly")
+        record["monthly"] = result.get("monthly")
+    else:
+        record["account"] = result.get("account", "")
+        record["total_records"] = result.get("total_records", 0)
+        record["date_range"] = result.get("date_range")
+        record["total_cost_usd"] = result.get("total_cost_usd", 0)
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -96,7 +107,7 @@ def resolve_credentials() -> tuple[str, str]:
         except OSError:
             pass
 
-    console.print("[red]未找到认证信息。请设置：[/red]")
+    console.print("[red]未找到认证信息.请设置:[/red]")
     console.print("  环境变量:")
     console.print("    [cyan]export OPENCODE_GO_WORKSPACE_ID='wrk_xxxxx'[/cyan]")
     console.print("    [cyan]export OPENCODE_GO_AUTH_COOKIE='***'[/cyan]")
@@ -109,11 +120,10 @@ def resolve_credentials() -> tuple[str, str]:
 
 
 async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> str | None:
-    """获取页面内容。返回 HTML 字符串，失败时打印错误并返回 None。"""
+    """获取页面内容.返回 HTML 字符串,失败时打印错误并返回 None."""
     url = f"{BASE_URL}/workspace/{workspace_id}{path_suffix}"
     cookie_header = f"auth={auth_cookie}; oc_locale=zh"
 
-    # 用 SyncClient + asyncio 子线程跑 httpx 避开代理
     async with httpx.AsyncClient(
         headers=HEADERS, follow_redirects=True, verify=False
     ) as client:
@@ -129,7 +139,7 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
             return None
 
     if r.status_code in (301, 302, 401, 403):
-        console.print("[red]⚠ Cookie 已过期或无效，请重新获取[/red]")
+        console.print("[red]⚠ Cookie 已过期或无效,请重新获取[/red]")
         return None
     if r.status_code != 200:
         console.print(f"[red]⚠ HTTP {r.status_code}[/red]")
@@ -137,7 +147,7 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
 
     # 检查是否被重定向到登录页
     if "login" in r.url.path.lower() or "authorize" in r.text[:2000].lower():
-        console.print("[red]⚠ Cookie 已过期，被重定向到登录页[/red]")
+        console.print("[red]⚠ Cookie 已过期,被重定向到登录页[/red]")
         return None
 
     return r.text
@@ -146,78 +156,154 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
 # ── Usage records extraction ──────────────────────────────────────────
 
 
-def extract_records_from_script(script: str) -> list[dict]:
-    """从 SolidJS SSR 脚本中提取 $R[26]=[...] 中的用量数据。"""
-    # 找到包含 inputTokens 的数组赋值
-    for m in re.finditer(r'\$R\[\d+\]\s*=\s*(\[)', script):
-        idx = m.start(1)
-        raw = script[idx:]
+def js_object_to_json(text: str) -> str:
+    """将 JS 对象字面量转换为合法 JSON(处理未加引号的 key、Date、!0/!1)."""
+    # Date 对象 → 字符串
+    text = re.sub(r"""new\s+Date\(['"]([^'"]*)['"]\)""", r'"\1"', text)
+    # 布尔值 & undefined
+    text = text.replace('!0', 'true').replace('!1', 'false')
+    text = re.sub(r'\bundefined\b', 'null', text)
+    # 移除 $R[N]= 引用
+    text = re.sub(r'\$R\[\d+\]\s*=\s*', '', text)
+    # 引用未加引号的属性名(逐字符扫描避免误改字符串内内容)
+    result: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        # 字符串内:原样复制
+        if ch in ('"', "'"):
+            quote = ch
+            result.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                result.append(c)
+                if c == '\\':
+                    i += 1
+                    if i < n:
+                        result.append(text[i])
+                elif c == quote:
+                    break
+                i += 1
+            i += 1
+            continue
+        # 在 { 或 , 之后可能有未加引号的 key
+        if ch in ('{', ','):
+            result.append(ch)
+            i += 1
+            while i < n and text[i] in ' \n\r\t':
+                result.append(text[i])
+                i += 1
+            if i < n and (text[i].isalpha() or text[i] in '_$'):
+                key_start = i
+                while i < n and (text[i].isalnum() or text[i] in '_$'):
+                    i += 1
+                key = text[key_start:i]
+                while i < n and text[i] in ' \n\r\t':
+                    i += 1
+                if i < n and text[i] == ':':
+                    result.append(f'"{key}":')
+                    i += 1
+                else:
+                    result.append(key)
+                continue
+        result.append(ch)
+        i += 1
+    return ''.join(result)
 
-        # 平衡提取 []
-        depth = 0
-        i = 0
-        in_str = False
-        str_char = None
-        found_open = False
-        while i < len(raw):
-            ch = raw[i]
+
+def extract_records_from_script(script: str) -> list[dict]:
+    """从 SolidJS SSR 脚本中提取用量记录(逐对象解析,正确处理嵌套对象)."""
+    # 找到包含用量数据的 $R[N]=[ 数组
+    for m in re.finditer(r'\$R\[\d+\]=\[', script):
+        array_start = m.end()
+        # 平衡提取外层 []
+        depth, pos, in_str, str_char = 1, array_start, False, None
+        while pos < len(script) and depth > 0:
+            ch = script[pos]
             if in_str:
-                if ch == "\\":
-                    i += 2
+                if ch == '\\':
+                    pos += 2
                     continue
                 if ch == str_char:
                     in_str = False
             else:
                 if ch in ('"', "'"):
-                    in_str = True
-                    str_char = ch
-                elif ch == "[":
+                    in_str, str_char = True, ch
+                elif ch == '[':
                     depth += 1
-                    found_open = True
-                elif ch == "]":
+                elif ch == ']':
                     depth -= 1
-                    if found_open and depth == 0:
-                        break
-            i += 1
-
-        if not found_open or depth != 0:
+            pos += 1
+        if depth != 0:
             continue
+        array_text = script[array_start:pos - 1]
 
-        arr_text = raw[: i + 1]
-
-        # 先尝试直接 JSON 解析
-        try:
-            data = json.loads(arr_text)
-            if isinstance(data, list) and data:
-                first = data[0]
-                if isinstance(first, dict) and ("inputTokens" in first or "cost" in first):
-                    return data
-        except json.JSONDecodeError:
-            pass
-
-        # 清理 JS -> JSON（仿 scrape-opencode.py 的 clean_js）
-        clean = arr_text
-        clean = re.sub(r'\$R\[\d+\]\s*=\s*', '', clean)
-        clean = re.sub(r'!0', 'true', clean)
-        clean = re.sub(r'!1', 'false', clean)
-        clean = re.sub(r"""new\s+Date\(['"]([^'"]*)['"]\)""", r'"\1"', clean)
-        clean = re.sub(r'\bundefined\b', 'null', clean)
-        clean = re.sub(
-            r'(?<!["\'])(\b[a-zA-Z_$][a-zA-Z0-9_$]*\b)(\s*:)', r'"\1"\2', clean
-        )
-
-        try:
-            data = json.loads(clean)
-            if isinstance(data, list) and data:
-                first = data[0]
-                if isinstance(first, dict) and (
-                    "inputTokens" in first or "outputTokens" in first or "cost" in first
-                ):
-                    return data
-        except json.JSONDecodeError:
-            continue
-
+        # 逐个提取 {} 对象
+        records: list[dict] = []
+        i = 0
+        while i < len(array_text):
+            # 跳过空白和逗号
+            while i < len(array_text) and array_text[i] in ' \n\r\t,':
+                i += 1
+            if i >= len(array_text):
+                break
+            # 跳过 $R[N]= 引用前缀
+            ref_m = re.match(r'\$R\[\d+\]=', array_text[i:])
+            if ref_m:
+                i += ref_m.end()
+            if i >= len(array_text) or array_text[i] != '{':
+                next_comma = array_text.find(',', i)
+                i = next_comma + 1 if next_comma != -1 else len(array_text)
+                continue
+            # 平衡 {}
+            brace_depth, j, in_str2, str_char2 = 1, i + 1, False, None
+            while j < len(array_text) and brace_depth > 0:
+                ch = array_text[j]
+                if in_str2:
+                    if ch == '\\':
+                        j += 2
+                        continue
+                    if ch == str_char2:
+                        in_str2 = False
+                else:
+                    if ch in ('"', "'"):
+                        in_str2, str_char2 = True, ch
+                    elif ch == '{':
+                        brace_depth += 1
+                    elif ch == '}':
+                        brace_depth -= 1
+                j += 1
+            if brace_depth == 0:
+                obj_text = array_text[i:j]
+                clean = js_object_to_json(obj_text)
+                try:
+                    obj = json.loads(clean)
+                    if isinstance(obj, dict) and 'inputTokens' in obj:
+                        records.append(obj)
+                except json.JSONDecodeError:
+                    pass
+                i = j
+            else:
+                break
+        if records:
+            return records
     return []
+
+
+async def fetch_usage_records(workspace_id: str, auth_cookie: str) -> list[dict] | None:
+    """获取 /usage 页面并解析出用量记录. 失败时返回 None."""
+    usage_html = await fetch_page(workspace_id, auth_cookie, "/usage")
+    if usage_html is None:
+        return None
+    for m in re.finditer(r"<script[^>]*>(.*?)</script>", usage_html, re.DOTALL):
+        script = m.group(1)
+        if "inputTokens" in script:
+            records = extract_records_from_script(script)
+            if records:
+                return records
+    return None
 
 
 def extract_email(text: str) -> str:
@@ -262,7 +348,7 @@ def build_progress_bar(pct: float, width: int = 20) -> tuple[str, str]:
 
 
 def calc_windows(records: list[dict], now: datetime) -> dict:
-    """从用量记录算出三个窗口的已用比例和重置倒计时。"""
+    """从用量记录算出三个窗口的已用比例和重置倒计时."""
     now_ts = now.timestamp()
 
     # 解析所有记录
@@ -305,7 +391,7 @@ def calc_windows(records: list[dict], now: datetime) -> dict:
         "resets_in": rolling_reset,
     }
 
-    # 每周窗口（UTC 周一 00:00）
+    # 每周窗口(UTC 周一 00:00)
     week_start = _week_start_utc(now)
     week_end = week_start + 7 * 86400
     weekly_cost = sum(p["cost"] for p in parsed if week_start <= p["ts"] < week_end)
@@ -316,7 +402,7 @@ def calc_windows(records: list[dict], now: datetime) -> dict:
         "resets_in": weekly_reset,
     }
 
-    # 每月窗口（基于最早记录的订阅锚定）
+    # 每月窗口(基于最早记录的订阅锚定)
     month_start, month_end = _subscription_month_bounds(now, earliest_record_ts)
     monthly_cost = sum(p["cost"] for p in parsed if month_start <= p["ts"] < month_end)
     monthly_reset = max(0, int(month_end - now_ts))
@@ -330,10 +416,8 @@ def calc_windows(records: list[dict], now: datetime) -> dict:
 
 
 def _week_start_utc(dt: datetime) -> float:
-    """返回当前 UTC 周一的 00:00:00 的时间戳。"""
-    # 用 UTC 计算
+    """返回当前 UTC 周一的 00:00:00 的时间戳."""
     utc = dt.astimezone(timezone.utc)
-    # Monday = 0
     days_since_monday = utc.weekday()
     monday = utc - timedelta(days=days_since_monday)
     monday_midnight = monday.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -341,7 +425,7 @@ def _week_start_utc(dt: datetime) -> float:
 
 
 def _subscription_month_bounds(now: datetime, earliest_ts: float) -> tuple[float, float]:
-    """计算订阅月的起止时间戳。基于最早一条记录作为锚点。"""
+    """计算订阅月的起止时间戳.基于最早一条记录作为锚点."""
     earliest = datetime.fromtimestamp(earliest_ts, tz=timezone.utc)
 
     # 锚定到 earliest 的日/时/分/秒
@@ -426,7 +510,7 @@ def render(data: dict):
         lines.append(f"  · 剩余 {time_str}\n", style="dim")
 
     if not has_data:
-        lines.append("未获取到用量数据。\n", style="yellow")
+        lines.append("未获取到用量数据.\n", style="yellow")
 
     ts = data.get("_timestamp", "")
     if ts:
@@ -488,20 +572,10 @@ async def query(workspace_id: str, auth_cookie: str) -> dict:
     result["account"] = extract_email(go_html)
 
     # Step 2: Fetch /usage page → extract detailed records
-    usage_html = await fetch_page(workspace_id, auth_cookie, "/usage")
-    if usage_html is None:
+    all_records = await fetch_usage_records(workspace_id, auth_cookie)
+    if all_records is None:
         result["_error"] = "无法获取用量页面"
         return result
-
-    # Find the script tag with usage data
-    all_records = []
-    for m in re.finditer(r"<script[^>]*>(.*?)</script>", usage_html, re.DOTALL):
-        script = m.group(1)
-        if "inputTokens" in script:
-            records = extract_records_from_script(script)
-            if records:
-                all_records = records
-                break
 
     if not all_records:
         result["_error"] = "未找到用量数据"
@@ -523,6 +597,24 @@ async def query(workspace_id: str, auth_cookie: str) -> dict:
             ).isoformat()
 
     return result
+
+
+# ── Enrichment ─────────────────────────────────────────────────────────
+
+
+def enrich_records(records: list[dict]) -> list[dict]:
+    """给 records 添加 _ts 和 _cost_usd 字段，并按时间排序."""
+    for r in records:
+        tc = r.get("timeCreated", "")
+        r["_ts"] = None
+        if tc:
+            try:
+                r["_ts"] = datetime.fromisoformat(tc.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                pass
+        r["_cost_usd"] = (r.get("cost", 0) or 0) / 100_000_000
+    records.sort(key=lambda r: r.get("_ts") or datetime.min.replace(tzinfo=timezone.utc))
+    return records
 
 
 # ── CLI Commands ───────────────────────────────────────────────────────
@@ -568,20 +660,238 @@ def cmd_history(args: list[str]):
         print(json.dumps(records, ensure_ascii=False, indent=2))
         return
 
-    console.print(f"\n[bold]📋 最近 {len(records)} 条查询记录[/bold]\n")
+    console.print(f"\n[bold]最近 {len(records)} 条查询记录[/bold]\n")
     for r in reversed(records):
         ts = r.get("timestamp", "?")[:19].replace("T", " ")
         acct = r.get("account", "")
+        qtype = r.get("type", "quota")
         parts = [f"  [dim]{ts}[/dim]"]
-        for k, label in [("rolling", "5h"), ("weekly", "W"), ("monthly", "M")]:
-            w = r.get(k) or {}
-            pct = w.get("used_pct", 0)
-            c = "red" if pct >= 90 else ("yellow" if pct >= 70 else "green")
-            parts.append(f"[{c}]{label} {pct:.1f}%[/{c}]")
+
+        if qtype == "recent":
+            total = r.get("total_records", 0)
+            cost = r.get("total_cost_usd", 0)
+            dr = r.get("date_range", {})
+            first = (dr.get("first", "") or "")[:16] if dr else ""
+            last = (dr.get("last", "") or "")[:16] if dr else ""
+            parts.append(f"[cyan]{total}条[/cyan]")
+            parts.append(f"[green]${cost:.6f}[/green]")
+            if first and last:
+                parts.append(f"[dim]{first}~{last}[/dim]")
+        else:
+            for k, label in [("rolling", "5h"), ("weekly", "W"), ("monthly", "M")]:
+                w = r.get(k) or {}
+                pct = w.get("used_pct", 0)
+                c = "red" if pct >= 90 else ("yellow" if pct >= 70 else "green")
+                parts.append(f"[{c}]{label} {pct:.1f}%[/{c}]")
+
         if acct:
             parts.append(f"[dim]{acct}[/dim]")
         console.print("  ".join(parts))
     console.print()
+
+
+def recent_to_json(records: list[dict]) -> dict:
+    """将已 enrich 的用量记录转为最近请求的 JSON 输出结构."""
+    if not records:
+        return {
+            "total_records": 0,
+            "date_range": {"first": None, "last": None},
+            "by_day": {},
+            "by_model": {},
+            "recent_requests": [],
+        }
+
+    by_day: dict[str, dict] = defaultdict(lambda: {
+        "requests": 0, "cost_usd": 0.0,
+        "input_tokens": 0, "output_tokens": 0,
+        "reasoning_tokens": 0, "cache_read_tokens": 0,
+    })
+    for r in records:
+        ts = r.get("_ts")
+        if ts:
+            day = ts.astimezone(TZ_BEIJING).strftime("%Y-%m-%d")
+            b = by_day[day]
+            b["requests"] += 1
+            b["cost_usd"] += r["_cost_usd"]
+            b["input_tokens"] += r.get("inputTokens", 0)
+            b["output_tokens"] += r.get("outputTokens", 0)
+            b["reasoning_tokens"] += r.get("reasoningTokens", 0)
+            b["cache_read_tokens"] += r.get("cacheReadTokens", 0)
+
+    by_model: dict[str, dict] = defaultdict(lambda: {"requests": 0, "cost_usd": 0.0})
+    for r in records:
+        m = r.get("model", "unknown")
+        by_model[m]["requests"] += 1
+        by_model[m]["cost_usd"] += r["_cost_usd"]
+
+    total_cost = sum(r["_cost_usd"] for r in records)
+
+    return {
+        "total_records": len(records),
+        "total_cost_usd": round(total_cost, 8),
+        "date_range": {
+            "first": records[0]["_ts"].astimezone(TZ_BEIJING).isoformat() if records[0].get("_ts") else None,
+            "last": records[-1]["_ts"].astimezone(TZ_BEIJING).isoformat() if records[-1].get("_ts") else None,
+        },
+        "by_day": {
+            day: {k: (round(v, 8) if k == "cost_usd" else v) for k, v in info.items()}
+            for day, info in sorted(by_day.items())
+        },
+        "by_model": dict(sorted(by_model.items(), key=lambda x: -x[1]["cost_usd"])),
+        "recent_requests": [
+            {
+                "time": r["_ts"].astimezone(TZ_BEIJING).strftime("%m-%d %H:%M:%S") if r.get("_ts") else None,
+                "model": r.get("model"),
+                "provider": r.get("provider"),
+                "input_tokens": r.get("inputTokens"),
+                "output_tokens": r.get("outputTokens"),
+                "reasoning_tokens": r.get("reasoningTokens"),
+                "cache_read_tokens": r.get("cacheReadTokens"),
+                "cost_usd": round(r["_cost_usd"], 8),
+            }
+            for r in records[-20:]
+        ],
+    }
+
+
+def render_recent(data: dict):
+    """用 rich 在终端渲染最近请求报告. 接收 recent_to_json() 输出的 data dict."""
+    records_count = data.get("total_records", 0)
+    if records_count == 0:
+        console.print("[yellow]未找到用量数据.[/yellow]")
+        return
+
+    by_day = data.get("by_day", {})
+    by_model = data.get("by_model", {})
+    recent_requests = data.get("recent_requests", [])
+    date_range = data.get("date_range", {})
+    total_cost = data.get("total_cost_usd", 0)
+
+    first_ts = date_range.get("first", "")
+    last_ts = date_range.get("last", "")
+    if first_ts and last_ts:
+        time_range = (
+            f"{first_ts[:16]} ~ {last_ts[:16]}"
+        )
+    else:
+        time_range = "未知"
+
+    # ── 按天聚合表格 ──────────────────────────────────────────────────
+    day_table = Table(
+        title="按天聚合", title_style="bold", show_lines=False,
+        border_style="cyan", padding=(0, 1),
+    )
+    day_table.add_column("日期", style="bold", no_wrap=True)
+    day_table.add_column("请求数", justify="right")
+    day_table.add_column("费用($)", justify="right")
+    day_table.add_column("Input", justify="right")
+    day_table.add_column("Output", justify="right")
+    day_table.add_column("Reasoning", justify="right")
+    day_table.add_column("Cache", justify="right")
+
+    for day, info in sorted(by_day.items()):
+        day_table.add_row(
+            day,
+            str(info.get("requests", 0)),
+            f"${info.get('cost_usd', 0):.6f}",
+            f"{info.get('input_tokens', 0):,}",
+            f"{info.get('output_tokens', 0):,}",
+            f"{info.get('reasoning_tokens', 0):,}",
+            f"{info.get('cache_read_tokens', 0):,}",
+        )
+
+    # ── 按模型聚合表格 ──────────────────────────────────────────────
+    model_table = Table(
+        title="按模型聚合", title_style="bold", show_lines=False,
+        border_style="cyan", padding=(0, 1),
+    )
+    model_table.add_column("模型", style="bold")
+    model_table.add_column("请求数", justify="right")
+    model_table.add_column("费用($)", justify="right")
+    for m, info in sorted(by_model.items(), key=lambda x: -x[1]["cost_usd"]):
+        model_table.add_row(m, str(info["requests"]), f"${info['cost_usd']:.6f}")
+
+    # ── 最近请求详情表格 ──────────────────────────────────────────────
+    req_table = Table(
+        title="最近 20 条请求", title_style="bold", show_lines=False,
+        border_style="cyan", padding=(0, 1),
+    )
+    req_table.add_column("时间", style="dim", no_wrap=True)
+    req_table.add_column("模型", style="bold")
+    req_table.add_column("Input", justify="right")
+    req_table.add_column("Output", justify="right")
+    req_table.add_column("Reasoning", justify="right")
+    req_table.add_column("Cache", justify="right")
+    req_table.add_column("费用($)", justify="right")
+    for r in recent_requests:
+        ts = r.get("time") or "?"
+        cost_str = f"${r.get('cost_usd', 0):.6f}"
+        req_table.add_row(
+            ts, r.get("model", "?"),
+            f"{r.get('input_tokens', 0):,}", f"{r.get('output_tokens', 0):,}",
+            f"{r.get('reasoning_tokens', 0):,}", f"{r.get('cache_read_tokens', 0):,}",
+            cost_str,
+        )
+
+    header = Text()
+    header.append("时间范围: ", style="dim")
+    header.append(time_range, style="bold")
+    header.append("    共 ", style="dim")
+    header.append(str(records_count), style="bold")
+    header.append(" 条记录    总费用: ", style="dim")
+    header.append(f"${total_cost:.6f}", style="bold green")
+
+    console.print()
+    console.print(
+        Panel(header, title="[bold]OpenCode Go 近期用量[/bold]", border_style="cyan", padding=(1, 2))
+    )
+    console.print(day_table)
+    console.print()
+    console.print(model_table)
+    console.print()
+    console.print(req_table)
+    console.print()
+
+
+async def cmd_recent(args: list[str]):
+    """获取 /usage 页面,解析并展示最近的 API 请求记录."""
+    json_mode = "--json" in args
+    ws_id, cookie = resolve_credentials()
+
+    usage_html = await fetch_page(ws_id, cookie, "/usage")
+    if usage_html is None:
+        if json_mode:
+            print("{}")
+        else:
+            console.print("[red]⚠ 无法获取用量页面[/red]")
+        return
+
+    records = await fetch_usage_records(ws_id, cookie)
+
+    if not records:
+        if json_mode:
+            print("{}")
+        else:
+            console.print("[yellow]未找到用量数据.[/yellow]")
+        return
+
+    # 一次性 enrich（_ts / _cost_usd / 排序）
+    enrich_records(records)
+
+    # 提取账号
+    account = extract_email(usage_html)
+
+    # 构建输出数据（enrich 后传入，recent_to_json 不再自行解析）
+    output = recent_to_json(records)
+    output["account"] = account
+
+    # 保存到历史
+    save_history(output, query_type="recent")
+
+    if json_mode:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        render_recent(output)
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -596,6 +906,10 @@ async def main_async():
 
     if args and args[0] == "history":
         cmd_history(args[1:])
+        return
+
+    if args and args[0] == "recent":
+        await cmd_recent(args[1:])
         return
 
     json_mode = "--json" in args
