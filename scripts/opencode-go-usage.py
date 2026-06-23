@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+#
+# Usage:
+#   uv run --with-requirements requirements.txt scripts/opencode-go-usage.py
+#
 """opencode-go-usage — OpenCode Go 套餐用量查询 CLI"""
 
 import asyncio
@@ -91,6 +95,7 @@ def save_history(result: dict, query_type: str = "quota"):
         record["by_day"] = result.get("by_day", {})
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    Path(HISTORY_PATH).chmod(0o600)
 
 
 # ── Credential resolution ──────────────────────────────────────────────
@@ -129,6 +134,7 @@ def resolve_credentials() -> tuple[str, str]:
 async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> str | None:
     """获取页面内容.返回 HTML 字符串,失败时打印错误并返回 None."""
     url = f"{BASE_URL}/workspace/{workspace_id}{path_suffix}"
+    masked_url = url.replace(workspace_id, workspace_id[:7] + "***")
     cookie_header = f"auth={auth_cookie}; oc_locale=zh"
 
     async with httpx.AsyncClient(
@@ -139,9 +145,9 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
                 url, headers={"Cookie": cookie_header}, timeout=60
             )
         except httpx.TimeoutException:
-            console.print(f"[red]⚠ 请求超时: {url}[/red]")
+            console.print(f"[red]⚠ 请求超时: {masked_url}[/red]")
             return None
-        except Exception as e:
+        except httpx.RequestError as e:
             console.print(f"[red]⚠ 请求失败: {e}[/red]")
             return None
 
