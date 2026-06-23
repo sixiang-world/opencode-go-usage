@@ -23,6 +23,12 @@ HISTORY_PATH = Path.home() / ".opencode-go-usage-history.jsonl"
 LEGACY_COOKIE_DIR = Path.home() / "opencode-usage"
 LEGACY_COOKIE_FILE = LEGACY_COOKIE_DIR / ".opencode-auth"
 
+# _server function hashes
+_SERVER_HASHES = {
+    "getCosts": "15702f3a12ff8bff357f8c2aa154a17e65b746d5f6b96adc9002c86ee0c15205",
+    "getUsageInfo_1": "bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c",
+}
+
 console = Console()
 
 TZ_BEIJING = timezone(timedelta(hours=8))
@@ -65,8 +71,8 @@ def save_config(workspace_id: str, auth_cookie: str):
 
 
 def save_history(result: dict, query_type: str = "quota"):
-    """保存查询记录到历史文件. query_type: 'quota' (默认用量) 或 'recent' (最近请求)."""
-    if query_type not in ("quota", "recent"):
+    """保存查询记录到历史文件. query_type: 'quota', 'recent', 'costs'."""
+    if query_type not in ("quota", "recent", "costs"):
         raise ValueError(f"Unknown query_type: {query_type!r}")
     record: dict[str, Any] = {
         "timestamp": datetime.now(TZ_BEIJING).isoformat(),
@@ -77,11 +83,16 @@ def save_history(result: dict, query_type: str = "quota"):
         record["rolling"] = result.get("rolling")
         record["weekly"] = result.get("weekly")
         record["monthly"] = result.get("monthly")
-    else:
+    elif query_type == "recent":
         record["account"] = result.get("account", "")
         record["total_records"] = result.get("total_records", 0)
         record["date_range"] = result.get("date_range")
         record["total_cost_usd"] = result.get("total_cost_usd", 0)
+    elif query_type == "costs":
+        record["account"] = result.get("account", "")
+        record["month"] = result.get("month", "")
+        record["total_cost_usd"] = result.get("total_cost_usd", 0)
+        record["by_model"] = result.get("by_model", {})
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -151,6 +162,113 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
         return None
 
     return r.text
+
+
+# ── Server function calls ────────────────────────────────────────────
+
+
+def _seroval_string(s: str) -> str:
+    return json.dumps({"t": 1, "s": s}, separators=(",", ":"))
+
+
+def _seroval_number(n: int | float) -> str:
+    return json.dumps({"t": 2, "n": n}, separators=(",", ":"))
+
+
+def _seroval_null() -> str:
+    return '{"t":0,"s":0}'
+
+
+def build_server_url(fn_name: str, args: list[tuple[str, Any]]) -> str:
+    """Build _server GET URL. args: list of (type, value) where type is 'string' or 'number'."""
+    parts: list[str] = []
+    for typ, val in args:
+        if typ == "string":
+            parts.append(_seroval_string(val))
+        elif typ == "number":
+            parts.append(_seroval_number(val))
+        elif typ == "null":
+            parts.append(_seroval_null())
+    inner = ",".join(parts)
+    seroval_args = (
+        '{"t":{"t":9,"i":0,"l":' + str(len(args)) + ',"a":['
+        + inner
+        + '],"o":0},"f":31,"m":[]}'
+    )
+    fn_hash = _SERVER_HASHES[fn_name]
+    from urllib.parse import quote
+    return f"{BASE_URL}/_server?id={fn_hash}&args={quote(seroval_args)}"
+
+
+def parse_server_response(body: str) -> Any:
+    """Extract JSON data from SolidJS _server stream response."""
+    # Response format: ;0x...;((self.$R=self.$R||{})["server-fn:N"]=[],($R=>$R[0]={...})...)
+    # Find the { ... } or [ ... ] object in the assignment
+    match = re.search(r'\$R\[0\]\s*=\s*(\{[\s\S]*\}|\[[\s\S]*\])', body)
+    if not match:
+        # fallback: find the first { or [ after the last function call
+        match = re.search(r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})', body)
+    if not match:
+        return None
+    raw = match.group(1)
+    clean = js_object_to_json(raw)
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        return None
+
+
+async def call_server_function(
+    workspace_id: str, auth_cookie: str,
+    fn_name: str, args: list[tuple[str, Any]],
+) -> Any:
+    """Call a SolidJS server function via _server endpoint (POST). Returns parsed JSON."""
+    fn_hash = _SERVER_HASHES[fn_name]
+    url = f"{BASE_URL}/_server"
+    cookie_header = f"auth={auth_cookie}; oc_locale=zh"
+
+    # Build seroval args body (same format as the SolidJS client sends)
+    parts: list[str] = []
+    for typ, val in args:
+        if typ == "string":
+            parts.append(json.dumps({"t": 1, "s": val}, separators=(",", ":")))
+        elif typ == "number":
+            parts.append(json.dumps({"t": 2, "n": val}, separators=(",", ":")))
+        elif typ == "null":
+            parts.append('{"t":0,"s":0}')
+    inner = ",".join(parts)
+    body = json.dumps({
+        "t": {"t": 9, "i": 0, "l": len(args), "a": json.loads("[" + inner + "]"), "o": 0},
+        "f": 31,
+        "m": [],
+    }, separators=(",", ":"))
+
+    async with httpx.AsyncClient(
+        headers=HEADERS, follow_redirects=True, verify=False,
+    ) as client:
+        try:
+            r = await client.post(
+                url,
+                headers={
+                    "Cookie": cookie_header,
+                    "X-Server-Id": fn_hash,
+                    "Content-Type": "text/plain;charset=utf-8",
+                },
+                content=body,
+                timeout=30,
+            )
+        except httpx.TimeoutException:
+            console.print(f"[red]⚠ 请求超时 ({fn_name})[/red]")
+            return None
+        except Exception as e:
+            console.print(f"[red]⚠ 请求失败 ({fn_name}): {e}[/red]")
+            return None
+
+    if r.status_code != 200:
+        console.print(f"[red]⚠ {fn_name} 返回 HTTP {r.status_code}[/red]")
+        return None
+
+    return parse_server_response(r.text)
 
 
 # ── Usage records extraction ──────────────────────────────────────────
@@ -304,6 +422,40 @@ async def fetch_usage_records(workspace_id: str, auth_cookie: str) -> list[dict]
             if records:
                 return records
     return None
+
+
+async def fetch_costs(
+    workspace_id: str, auth_cookie: str, year: int, month: int,
+) -> dict | None:
+    """获取月度费用聚合数据(从用量记录按天聚合). 失败时返回 None."""
+    records = await fetch_usage_records(workspace_id, auth_cookie)
+    if not records:
+        return None
+
+    from collections import defaultdict
+    enrich_records(records)
+
+    # Aggregate by date x model
+    usage: list[dict] = []
+    by_date_model: dict = defaultdict(lambda: defaultdict(int))
+    for r in records:
+        ts = r.get("_ts")
+        if not ts:
+            continue
+        d = ts.astimezone(TZ_BEIJING).strftime("%Y-%m-%d")
+        model = r.get("model", "unknown")
+        by_date_model[d][model] += r.get("cost", 0)
+
+    for date in sorted(by_date_model.keys()):
+        for model, total_cost in sorted(by_date_model[date].items()):
+            usage.append({
+                "date": date,
+                "model": model,
+                "totalCost": total_cost,
+                "plan": "lite",
+            })
+
+    return {"usage": usage, "keys": []}
 
 
 def extract_email(text: str) -> str:
@@ -677,6 +829,17 @@ def cmd_history(args: list[str]):
             parts.append(f"[green]${cost:.6f}[/green]")
             if first and last:
                 parts.append(f"[dim]{first}~{last}[/dim]")
+        elif qtype == "costs":
+            cost = r.get("total_cost_usd", 0)
+            mo = r.get("month", "")
+            by_m = r.get("by_model", {})
+            parts.append(f"[cyan]costs[/cyan]")
+            parts.append(f"[dim]{mo}[/dim]")
+            parts.append(f"[green]${cost:.6f}[/green]")
+            if by_m:
+                top_models = sorted(by_m.items(), key=lambda x: -x[1])[:3]
+                model_str = " ".join(f"{m}=${c:.6f}" for m, c in top_models)
+                parts.append(f"[dim]{model_str}[/dim]")
         else:
             for k, label in [("rolling", "5h"), ("weekly", "W"), ("monthly", "M")]:
                 w = r.get(k) or {}
@@ -853,6 +1016,111 @@ def render_recent(data: dict):
     console.print()
 
 
+def costs_to_json(costs_data: dict, year: int, month: int, account: str = "") -> dict:
+    """将 getCosts 原始响应聚合为输出结构."""
+    usage = costs_data.get("usage", [])
+    keys = costs_data.get("keys", [])
+
+    by_day: dict[str, dict] = defaultdict(lambda: {"total_usd": 0.0, "models": defaultdict(float)})
+    by_model: dict[str, float] = defaultdict(float)
+
+    for entry in usage:
+        date = entry.get("date", "")
+        model = entry.get("model", "unknown")
+        cost_usd = entry.get("totalCost", 0) / 100_000_000
+
+        by_day[date]["total_usd"] += cost_usd
+        by_day[date]["models"][model] += cost_usd
+        by_model[model] += cost_usd
+
+    total_cost = sum(by_model.values())
+
+    return {
+        "month": f"{year:04d}-{month:02d}",
+        "account": account,
+        "total_cost_usd": round(total_cost, 8),
+        "total_entries": len(usage),
+        "keys": [{"id": k["id"], "displayName": k.get("displayName", "")} for k in keys],
+        "by_day": {
+            day: {
+                "total_usd": round(info["total_usd"], 8),
+                "models": dict(sorted(info["models"].items(), key=lambda x: -x[1])),
+            }
+            for day, info in sorted(by_day.items())
+        },
+        "by_model": dict(sorted(
+            [(m, round(c, 8)) for m, c in by_model.items()],
+            key=lambda x: -x[1],
+        )),
+    }
+
+
+def render_costs(data: dict):
+    """用 rich 在终端渲染全月费用报告."""
+    total_cost = data.get("total_cost_usd", 0)
+    by_day = data.get("by_day", {})
+    by_model = data.get("by_model", {})
+    month = data.get("month", "")
+    keys = data.get("keys", [])
+
+    if not by_day:
+        console.print("[yellow]该月无费用数据.[/yellow]")
+        return
+
+    # ── Header ─────────────────────────────────────────────────────
+    header = Text()
+    header.append(f"月份: {month}", style="bold")
+    header.append(f"    总费用: ", style="dim")
+    header.append(f"${total_cost:.6f}", style="bold green")
+    if keys:
+        header.append(f"    API Keys: ", style="dim")
+        header.append(str(len(keys)), style="bold")
+
+    console.print()
+    console.print(
+        Panel(header, title="[bold]OpenCode Go 全月费用[/bold]", border_style="cyan", padding=(1, 2))
+    )
+
+    # ── 按天费用表格 ──────────────────────────────────────────────
+    day_table = Table(
+        title="按天费用", title_style="bold", show_lines=False,
+        border_style="cyan", padding=(0, 1),
+    )
+    day_table.add_column("日期", style="bold", no_wrap=True)
+    day_table.add_column("费用($)", justify="right")
+    day_table.add_column("模型明细", style="dim")
+
+    max_day_cost = max(info["total_usd"] for info in by_day.values()) if by_day else 1
+
+    for day, info in sorted(by_day.items()):
+        cost = info["total_usd"]
+        bar_len = int(cost / max_day_cost * 20) if max_day_cost > 0 else 0
+        bar = "█" * bar_len
+        models_str = "  ".join(
+            f"{m}: ${c:.6f}" for m, c in info["models"].items()
+        )
+        day_table.add_row(day, f"${cost:.6f}", f"{bar} {models_str}")
+
+    console.print(day_table)
+
+    # ── 按模型聚合表格 ──────────────────────────────────────────────
+    model_table = Table(
+        title="按模型聚合", title_style="bold", show_lines=False,
+        border_style="cyan", padding=(0, 1),
+    )
+    model_table.add_column("模型", style="bold")
+    model_table.add_column("费用($)", justify="right")
+    model_table.add_column("占比", justify="right")
+
+    for model, cost in by_model.items():
+        pct = cost / total_cost * 100 if total_cost > 0 else 0
+        model_table.add_row(model, f"${cost:.6f}", f"{pct:.1f}%")
+
+    console.print()
+    console.print(model_table)
+    console.print()
+
+
 async def cmd_recent(args: list[str]):
     """获取 /usage 页面,解析并展示最近的 API 请求记录."""
     json_mode = "--json" in args
@@ -894,7 +1162,48 @@ async def cmd_recent(args: list[str]):
         render_recent(output)
 
 
-# ── Main ───────────────────────────────────────────────────────────────
+async def cmd_costs(args: list[str]):
+    """获取全月聚合费用数据并展示."""
+    json_mode = "--json" in args
+    month_str = ""
+    for i, a in enumerate(args):
+        if a == "--month" and i + 1 < len(args):
+            month_str = args[i + 1]
+
+    now = datetime.now(TZ_BEIJING)
+    if month_str:
+        try:
+            year, month = map(int, month_str.split("-"))
+        except (ValueError, AttributeError):
+            if json_mode:
+                print(json.dumps({"ok": False, "errors": ["--month 格式应为 YYYY-MM"]}, ensure_ascii=False))
+            else:
+                console.print("[red]--month 格式应为 YYYY-MM[/red]")
+            return
+    else:
+        year, month = now.year, now.month
+
+    ws_id, cookie = resolve_credentials()
+    costs_data = await fetch_costs(ws_id, cookie, year, month)
+
+    if costs_data is None:
+        if json_mode:
+            print("{}")
+        else:
+            console.print("[red]⚠ 无法获取费用数据[/red]")
+        return
+
+    # 提取账号（复用 /usage 页面）
+    usage_html = await fetch_page(ws_id, cookie, "/usage")
+    account = extract_email(usage_html) if usage_html else ""
+
+    output = costs_to_json(costs_data, year, month, account)
+    save_history(output, query_type="costs")
+
+    if json_mode:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+    else:
+        render_costs(output)
 
 
 async def main_async():
@@ -910,6 +1219,10 @@ async def main_async():
 
     if args and args[0] == "recent":
         await cmd_recent(args[1:])
+        return
+
+    if args and args[0] == "costs":
+        await cmd_costs(args[1:])
         return
 
     json_mode = "--json" in args
