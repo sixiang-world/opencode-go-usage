@@ -132,7 +132,7 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
     cookie_header = f"auth={auth_cookie}; oc_locale=zh"
 
     async with httpx.AsyncClient(
-        headers=HEADERS, follow_redirects=True, verify=False
+        headers=HEADERS, follow_redirects=True, timeout=30.0,
     ) as client:
         try:
             r = await client.get(
