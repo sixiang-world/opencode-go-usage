@@ -115,7 +115,7 @@ def resolve_credentials() -> tuple[str, str]:
         try:
             c = LEGACY_COOKIE_FILE.read_text().strip()
             if c:
-                return "wrk_PLACEHOLDER", c
+                return "wrk_PLACEHOLDER", c  # set via save command
         except OSError:
             pass
 
@@ -142,7 +142,7 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
     ) as client:
         try:
             r = await client.get(
-                url, headers={"Cookie": cookie_header}, timeout=60
+                url, headers={"Cookie": cookie_header},
             )
         except httpx.TimeoutException:
             console.print(f"[red]⚠ 请求超时: {masked_url}[/red]")
