@@ -23,11 +23,6 @@ HISTORY_PATH = Path.home() / ".opencode-go-usage-history.jsonl"
 LEGACY_COOKIE_DIR = Path.home() / "opencode-usage"
 LEGACY_COOKIE_FILE = LEGACY_COOKIE_DIR / ".opencode-auth"
 
-# _server function hashes
-_SERVER_HASHES = {
-    "getCosts": "15702f3a12ff8bff357f8c2aa154a17e65b746d5f6b96adc9002c86ee0c15205",
-    "getUsageInfo_1": "bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c",
-}
 
 console = Console()
 
@@ -93,6 +88,7 @@ def save_history(result: dict, query_type: str = "quota"):
         record["month"] = result.get("month", "")
         record["total_cost_usd"] = result.get("total_cost_usd", 0)
         record["by_model"] = result.get("by_model", {})
+        record["by_day"] = result.get("by_day", {})
     with open(HISTORY_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -164,111 +160,11 @@ async def fetch_page(workspace_id: str, auth_cookie: str, path_suffix: str) -> s
     return r.text
 
 
-# ── Server function calls ────────────────────────────────────────────
-
-
-def _seroval_string(s: str) -> str:
-    return json.dumps({"t": 1, "s": s}, separators=(",", ":"))
-
-
-def _seroval_number(n: int | float) -> str:
-    return json.dumps({"t": 2, "n": n}, separators=(",", ":"))
-
-
-def _seroval_null() -> str:
-    return '{"t":0,"s":0}'
-
-
-def build_server_url(fn_name: str, args: list[tuple[str, Any]]) -> str:
-    """Build _server GET URL. args: list of (type, value) where type is 'string' or 'number'."""
-    parts: list[str] = []
-    for typ, val in args:
-        if typ == "string":
-            parts.append(_seroval_string(val))
-        elif typ == "number":
-            parts.append(_seroval_number(val))
-        elif typ == "null":
-            parts.append(_seroval_null())
-    inner = ",".join(parts)
-    seroval_args = (
-        '{"t":{"t":9,"i":0,"l":' + str(len(args)) + ',"a":['
-        + inner
-        + '],"o":0},"f":31,"m":[]}'
-    )
-    fn_hash = _SERVER_HASHES[fn_name]
-    from urllib.parse import quote
-    return f"{BASE_URL}/_server?id={fn_hash}&args={quote(seroval_args)}"
-
-
-def parse_server_response(body: str) -> Any:
-    """Extract JSON data from SolidJS _server stream response."""
-    # Response format: ;0x...;((self.$R=self.$R||{})["server-fn:N"]=[],($R=>$R[0]={...})...)
-    # Find the { ... } or [ ... ] object in the assignment
-    match = re.search(r'\$R\[0\]\s*=\s*(\{[\s\S]*\}|\[[\s\S]*\])', body)
-    if not match:
-        # fallback: find the first { or [ after the last function call
-        match = re.search(r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})', body)
-    if not match:
-        return None
-    raw = match.group(1)
-    clean = js_object_to_json(raw)
-    try:
-        return json.loads(clean)
-    except json.JSONDecodeError:
-        return None
-
-
-async def call_server_function(
-    workspace_id: str, auth_cookie: str,
-    fn_name: str, args: list[tuple[str, Any]],
-) -> Any:
-    """Call a SolidJS server function via _server endpoint (POST). Returns parsed JSON."""
-    fn_hash = _SERVER_HASHES[fn_name]
-    url = f"{BASE_URL}/_server"
-    cookie_header = f"auth={auth_cookie}; oc_locale=zh"
-
-    # Build seroval args body (same format as the SolidJS client sends)
-    parts: list[str] = []
-    for typ, val in args:
-        if typ == "string":
-            parts.append(json.dumps({"t": 1, "s": val}, separators=(",", ":")))
-        elif typ == "number":
-            parts.append(json.dumps({"t": 2, "n": val}, separators=(",", ":")))
-        elif typ == "null":
-            parts.append('{"t":0,"s":0}')
-    inner = ",".join(parts)
-    body = json.dumps({
-        "t": {"t": 9, "i": 0, "l": len(args), "a": json.loads("[" + inner + "]"), "o": 0},
-        "f": 31,
-        "m": [],
-    }, separators=(",", ":"))
-
-    async with httpx.AsyncClient(
-        headers=HEADERS, follow_redirects=True, verify=False,
-    ) as client:
-        try:
-            r = await client.post(
-                url,
-                headers={
-                    "Cookie": cookie_header,
-                    "X-Server-Id": fn_hash,
-                    "Content-Type": "text/plain;charset=utf-8",
-                },
-                content=body,
-                timeout=30,
-            )
-        except httpx.TimeoutException:
-            console.print(f"[red]⚠ 请求超时 ({fn_name})[/red]")
-            return None
-        except Exception as e:
-            console.print(f"[red]⚠ 请求失败 ({fn_name}): {e}[/red]")
-            return None
-
-    if r.status_code != 200:
-        console.print(f"[red]⚠ {fn_name} 返回 HTTP {r.status_code}[/red]")
-        return None
-
-    return parse_server_response(r.text)
+# ── Server function calls ──
+# Removed: _SERVER_HASHES, _seroval_string, _seroval_number, _seroval_null,
+# build_server_url, parse_server_response, call_server_function.
+# These were unused after fetch_costs switched to SSR-based aggregation.
+# If re-adding SolidJS _server calls in the future, restore from git history.
 
 
 # ── Usage records extraction ──────────────────────────────────────────
@@ -427,7 +323,9 @@ async def fetch_usage_records(workspace_id: str, auth_cookie: str) -> list[dict]
 async def fetch_costs(
     workspace_id: str, auth_cookie: str, year: int, month: int,
 ) -> dict | None:
-    """获取月度费用聚合数据(从用量记录按天聚合). 失败时返回 None."""
+    """获取月度费用聚合数据(从用量记录按天聚合). 失败时返回 None.
+    Note: 内部调用 fetch_usage_records() 产生一次 HTTP 请求（与 cmd_recent 共享相同的数据源）。
+    """
     records = await fetch_usage_records(workspace_id, auth_cookie)
     if not records:
         return None
@@ -1095,7 +993,7 @@ def render_costs(data: dict):
     for day, info in sorted(by_day.items()):
         cost = info["total_usd"]
         bar_len = int(cost / max_day_cost * 20) if max_day_cost > 0 else 0
-        bar = "█" * bar_len
+        bar = "[cyan]" + "█" * bar_len + "[/cyan]"
         models_str = "  ".join(
             f"{m}: ${c:.6f}" for m, c in info["models"].items()
         )
