@@ -1157,8 +1157,29 @@ async def cmd_costs(args: list[str]):
         render_costs(output)
 
 
+USAGE_TEXT = """opencode-go-usage — OpenCode Go 套餐用量查询
+
+用法:
+  opencode-go-usage                    用量仪表盘（Rolling/Weekly/Monthly）
+  opencode-go-usage --json             用量仪表盘（JSON 输出）
+  opencode-go-usage save <ws> <ck>     保存 workspace_id 和 auth_cookie
+  opencode-go-usage history [N]        查看最近 N 条查询记录
+  opencode-go-usage recent [--json]    查看最近 API 请求记录
+  opencode-go-usage costs [--month YYYY-MM] [--json]  查看费用聚合
+  opencode-go-usage -h | --help        显示此帮助
+"""
+
+
+def print_usage():
+    console.print(USAGE_TEXT.strip())
+
+
 async def main_async():
     args = sys.argv[1:]
+
+    if args and args[0] in ("-h", "--help"):
+        print_usage()
+        return
 
     if args and args[0] == "save":
         cmd_save(args)
@@ -1175,6 +1196,15 @@ async def main_async():
     if args and args[0] == "costs":
         await cmd_costs(args[1:])
         return
+
+    # 检查是否有未知子命令（非 --json 且非 -h 的第一个 arg）
+    known_subcommands = {"save", "history", "recent", "costs"}
+    first = args[0] if args else None
+    if first is not None and first not in known_subcommands and not first.startswith("--"):
+        console.print(f"[red]错误: 未知子命令 '{first}'[/red]")
+        console.print()
+        print_usage()
+        sys.exit(1)
 
     json_mode = "--json" in args
     ws_id, cookie = resolve_credentials()
