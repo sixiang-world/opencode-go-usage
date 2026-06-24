@@ -372,6 +372,47 @@ def extract_email(text: str) -> str:
     return ""
 
 
+def extract_quota_from_go_page(html: str) -> dict | None:
+    """从 /go 页面的 SSR 中提取真实用量百分比."""
+    # 查找 rollingUsage 块: rollingUsage:X={status:"ok",resetInSec:N,usagePercent:N}
+    m = re.search(
+        r'rollingUsage:\$R\[\d+\]=\{status:"ok",resetInSec:(\d+),usagePercent:(\d+)\}'
+        r'.*?weeklyUsage:\$R\[\d+\]=\{status:"ok",resetInSec:(\d+),usagePercent:(\d+)\}'
+        r'.*?monthlyUsage:\$R\[\d+\]=\{status:"ok",resetInSec:(\d+),usagePercent:(\d+)\}',
+        html, re.DOTALL
+    )
+    if not m:
+        return None
+
+    now_bj = int(datetime.now(TZ_BEIJING).timestamp())
+    rolling_pct = int(m.group(2))
+    weekly_pct = int(m.group(4))
+    monthly_pct = int(m.group(6))
+
+    def fmt_reset(reset_in_sec: int) -> str:
+        return datetime.fromtimestamp(
+            now_bj + reset_in_sec, tz=TZ_BEIJING
+        ).isoformat()
+
+    return {
+        "rolling": {
+            "used_pct": rolling_pct,
+            "resets_in": int(m.group(1)),
+            "resets_at": fmt_reset(int(m.group(1))),
+        },
+        "weekly": {
+            "used_pct": weekly_pct,
+            "resets_in": int(m.group(3)),
+            "resets_at": fmt_reset(int(m.group(3))),
+        },
+        "monthly": {
+            "used_pct": monthly_pct,
+            "resets_in": int(m.group(5)),
+            "resets_at": fmt_reset(int(m.group(5))),
+        },
+    }
+
+
 def fmt_seconds(secs: int) -> str:
     if secs <= 0:
         return "即将重置"
@@ -627,6 +668,11 @@ async def query(workspace_id: str, auth_cookie: str) -> dict:
     # Extract email
     result["account"] = extract_email(go_html)
 
+    # Extract quota from /go page SSR (real usage percentages from OpenCode)
+    quota_data = extract_quota_from_go_page(go_html)
+    if quota_data:
+        result.update(quota_data)
+
     # Step 2: Fetch /usage page → extract detailed records
     all_records = await fetch_usage_records(workspace_id, auth_cookie)
     if all_records is None:
@@ -639,9 +685,10 @@ async def query(workspace_id: str, auth_cookie: str) -> dict:
 
     result["_records_count"] = len(all_records)
 
-    # Step 3: Calculate quota windows from records
-    windows = calc_windows(all_records, now)
-    result.update(windows)
+    # Step 3: Calculate quota windows from records (fallback if /go page had no data)
+    if "rolling" not in result:
+        windows = calc_windows(all_records, now)
+        result.update(windows)
 
     # Step 4: Add resets_at in Beijing time
     now_bj = int(datetime.now(TZ_BEIJING).timestamp())
