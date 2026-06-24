@@ -326,12 +326,105 @@ async def fetch_usage_records(workspace_id: str, auth_cookie: str) -> list[dict]
     return None
 
 
+# ── RPC endpoint ──────────────────────────────────────────────────
+
+COSTS_RPC_HASH = "15702f3a12ff8bff357f8c2aa154a17e65b746d5f6b96adc9002c86ee0c15205"
+COSTS_RPC_BODY_TPL = (
+    '{{"t":{{"t":9,"i":0,"l":4,"a":['
+    '{{"t":1,"s":"{workspace_id}"}},'
+    '{{"t":0,"s":{year}}},'
+    '{{"t":0,"s":{month}}},'
+    '{{"t":1,"s":"+08:00"}}'
+    '],"o":0}},"f":31,"m":[]}}'
+)
+
+
+def parse_solidstart_costs_response(text: str) -> dict | None:
+    """解析 SolidStart RPC streaming response 中的 costs 数据.
+
+    格式: ;0xNNNNNN;((self.$R=...)($R=>$R[0]={usage:..., keys:...})($R[...]))
+    """
+    # 找到 $R[0]={...} 之后的内容
+    m = re.search(
+        r'\$R\s*=>\s*\$R\s*\[\s*0\s*\]\s*=\s*(\{.*\})\s*\)\s*\(',
+        text, re.DOTALL
+    )
+    if not m:
+        return None
+
+    raw = m.group(1)
+    # 清理 JS 语法
+    # (1) !1 -> false, !0 -> true
+    raw = raw.replace('!1', 'false').replace('!0', 'true')
+    # (2) 移除 $R[N]= 前缀（出现在对象属性值嵌套处）
+    raw = re.sub(r'\$R\[\d+\]\s*=\s*', '', raw)
+    # (3) 给未加引号的属性名加双引号
+    raw = re.sub(
+        r'(?<!")(\b[a-zA-Z_$][\w$]*\b)(?=\s*:)',
+        r'"\1"',
+        raw,
+    )
+    # (4) 尝试解析 JSON
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+async def fetch_costs_via_rpc(
+    workspace_id: str, auth_cookie: str, year: int, month: int,
+) -> dict | None:
+    """通过 SolidStart RPC (_server) 获取月度费用聚合数据.
+
+    Returns {usage: [{date, model, totalCost, keyId, plan}], keys: [...]}
+    """
+    body = COSTS_RPC_BODY_TPL.format(
+        workspace_id=workspace_id, year=year, month=month - 1,
+    )
+    url = f"{BASE_URL}/_server"
+    cookie = f"auth={auth_cookie}; oc_locale=zh"
+
+    masked_ws = workspace_id[:7] + "***"
+    try:
+        async with httpx.AsyncClient(
+            headers=HEADERS, follow_redirects=True, timeout=30.0,
+        ) as client:
+            r = await client.post(
+                url,
+                content=body,
+                headers={
+                    "Cookie": cookie,
+                    "Content-Type": "application/json",
+                    "X-Server-Id": COSTS_RPC_HASH,
+                    "X-Server-Instance": "server-fn:0",
+                    "Origin": BASE_URL,
+                    "Referer": f"{BASE_URL}/workspace/{workspace_id}/usage",
+                },
+            )
+    except httpx.TimeoutException:
+        console.print("[red]⚠ 费用查询超时[/red]")
+        return None
+    except httpx.RequestError as e:
+        console.print(f"[red]⚠ 费用查询请求失败: {e}[/red]")
+        return None
+
+    if r.status_code != 200:
+        return None
+
+    data = parse_solidstart_costs_response(r.text)
+    return data
+
+
 async def fetch_costs(
     workspace_id: str, auth_cookie: str, year: int, month: int,
 ) -> dict | None:
-    """获取月度费用聚合数据(从用量记录按天聚合). 失败时返回 None.
-    Note: 内部调用 fetch_usage_records() 产生一次 HTTP 请求（与 cmd_recent 共享相同的数据源）。
-    """
+    """获取月度费用聚合数据. 优先通过 RPC 接口, 失败时回退到 SSR 记录聚合."""
+    # 优先通过 RPC 接口获取完整月度数据
+    data = await fetch_costs_via_rpc(workspace_id, auth_cookie, year, month)
+    if data and data.get("usage"):
+        return data
+
+    # 回退: 从 SSR 页面 50 条记录按天聚合
     records = await fetch_usage_records(workspace_id, auth_cookie)
     if not records:
         return None
@@ -339,7 +432,6 @@ async def fetch_costs(
     from collections import defaultdict
     enrich_records(records)
 
-    # Aggregate by date x model
     usage: list[dict] = []
     by_date_model: dict = defaultdict(lambda: defaultdict(int))
     for r in records:
